@@ -55,9 +55,28 @@ class TestOut(BaseModel):
     end_ts: int
     max_level: int
     imported_at: str
+    archived: bool = Field(
+        False, description="该试验是否已完成长期归档（原采样已压缩为压缩块）"
+    )
 
 
 class ImportResponse(TestOut):
     block_counts: dict[str, int] = Field(
         ..., description="每个摘要层级生成的块数"
+    )
+
+
+class ArchiveOut(BaseModel):
+    id: int = Field(..., description="归档记录 id")
+    test_id: int = Field(..., description="试验编号（沿用原试验 id 查询）")
+    block_count: int = Field(..., description="压缩块数量，与 level 1 摘要块一一对应")
+    sample_count: int = Field(..., description="被压缩的原始采样总行数")
+    raw_bytes: int = Field(..., description="压缩前定长记录的字节数")
+    compressed_bytes: int = Field(..., description="压缩帧落库字节数")
+    compression_ratio: float = Field(
+        ..., description="压缩比 compressed_bytes / raw_bytes"
+    )
+    archived_at: str = Field(..., description="归档完成时间（UTC 文本）")
+    already_archived: bool = Field(
+        ..., description="true 表示该试验此前已归档，本次请求未写入任何副本"
     )

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from . import config
+from .archive import read_compressed_samples
 
 # blocks 表的列 -> Stats 字段
 _BLOCK_FIELDS = (
@@ -184,14 +185,17 @@ def range_summary(
     max_level: int,
     block_size: int | None = None,
     metrics: Optional[dict] = None,
+    archived: bool = False,
 ) -> Optional[Stats]:
     """计算半开区间 [q_start, q_end) 内采样的四点统计。
 
     递归策略：
     1. 取当前最粗层级与区间相交的块；
     2. 块完整落在区间内 -> 直接采用块摘要（命中缓存，不读采样）；
-    3. 块被区间边界切开 -> 降到下一层递归；到 level 1 仍被切开
-       时，按 rowid 范围读取该块内的原始采样。
+    3. 块被区间边界切开 -> 降到下一层递归；到 level 1 仍被切开时，
+       按 rowid 范围取回该块的采样后按时间窗过滤：
+       未归档读 samples 原表，已归档则解压对应的 compressed_blocks 块。
+       无论哪种来源，raw_rows_read 只统计落在桶内的采样行数。
     """
     block_size = block_size or config.BLOCK_SIZE
     if metrics is None:
@@ -229,25 +233,45 @@ def range_summary(
 
             # 块被区间边界切开
             if level == 1:
-                # 最细索引块也被切开 -> 唯一需要读原始采样的情形
-                raw = conn.execute(
-                    """SELECT ts, pressure FROM samples
-                       WHERE test_id = ? AND rowid BETWEEN ? AND ?
-                         AND ts >= ? AND ts < ?
-                       ORDER BY rowid""",
-                    (
+                # 最细索引块也被切开 -> 唯一需要取回采样的情形。
+                # 归档后原采样行已删除，改为解压同 rowid 区间的压缩块，
+                # 再用桶时间窗过滤；raw_rows_read 只计桶内采样。
+                if archived:
+                    decoded = read_compressed_samples(
+                        conn,
                         test_id,
                         row["first_rowid"],
                         row["last_rowid"],
-                        q_start,
-                        q_end,
-                    ),
-                ).fetchall()
-                metrics["raw_rows_read"] += len(raw)
-                for r in raw:
-                    overall = merge_stats(
-                        overall, stats_from_sample(r["ts"], r["pressure"])
                     )
+                    in_range = [
+                        (ts, pressure)
+                        for ts, pressure in decoded
+                        if q_start <= ts < q_end
+                    ]
+                    metrics["raw_rows_read"] += len(in_range)
+                    for ts, pressure in in_range:
+                        overall = merge_stats(
+                            overall, stats_from_sample(ts, pressure)
+                        )
+                else:
+                    raw = conn.execute(
+                        """SELECT ts, pressure FROM samples
+                           WHERE test_id = ? AND rowid BETWEEN ? AND ?
+                             AND ts >= ? AND ts < ?
+                           ORDER BY rowid""",
+                        (
+                            test_id,
+                            row["first_rowid"],
+                            row["last_rowid"],
+                            q_start,
+                            q_end,
+                        ),
+                    ).fetchall()
+                    metrics["raw_rows_read"] += len(raw)
+                    for r in raw:
+                        overall = merge_stats(
+                            overall, stats_from_sample(r["ts"], r["pressure"])
+                        )
             else:
                 # 递归处理该父块在更细一层中的子块，区间裁剪到父块覆盖范围。
                 # 右端取 end_ts+1：当父块末点本就落在桶内时，保证最末子块
@@ -261,6 +285,7 @@ def range_summary(
                     level - 1,
                     block_size,
                     metrics,
+                    archived,
                 )
                 if sub is not None:
                     overall = merge_stats(overall, sub)

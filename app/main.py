@@ -6,14 +6,17 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import sqlite3
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from sqlite3 import Connection
 
 from . import config
+from .archive import AlreadyArchived, ArchiveError, archive_test, get_archive
+from .codec import ArchiveCodecError
 from .db import init_db, session
 from .ingest import CsvValidationError, import_test
-from .schemas import ImportResponse, QueryResponse, TestOut
+from .schemas import ArchiveOut, ImportResponse, QueryResponse, TestOut
 from .service import bucket_query
 
 
@@ -72,11 +75,18 @@ def upload_test(
     return result
 
 
+_TEST_COLUMNS = (
+    "t.id, t.name, t.source_filename, t.sample_count, t.start_ts, t.end_ts, "
+    "t.max_level, t.imported_at, "
+    "CASE WHEN a.test_id IS NULL THEN 0 ELSE 1 END AS archived"
+)
+
+
 @app.get("/tests", response_model=list[TestOut], tags=["试验查询"], summary="列出全部试验")
 def list_tests(conn: Connection = Depends(get_conn)):
     rows = conn.execute(
-        "SELECT id, name, source_filename, sample_count, start_ts, end_ts, "
-        "max_level, imported_at FROM tests ORDER BY id"
+        f"SELECT {_TEST_COLUMNS} FROM tests t "
+        "LEFT JOIN archives a ON a.test_id = t.id ORDER BY t.id"
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -89,13 +99,53 @@ def list_tests(conn: Connection = Depends(get_conn)):
 )
 def get_test(test_id: int, conn: Connection = Depends(get_conn)):
     row = conn.execute(
-        "SELECT id, name, source_filename, sample_count, start_ts, end_ts, "
-        "max_level, imported_at FROM tests WHERE id = ?",
+        f"SELECT {_TEST_COLUMNS} FROM tests t "
+        "LEFT JOIN archives a ON a.test_id = t.id WHERE t.id = ?",
         (test_id,),
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"试验 {test_id} 不存在")
     return dict(row)
+
+
+@app.get(
+    "/tests/{test_id}/archive",
+    response_model=ArchiveOut,
+    tags=["试验归档"],
+    summary="查看试验的归档状态与压缩统计",
+)
+def get_test_archive(test_id: int, conn: Connection = Depends(get_conn)):
+    if conn.execute("SELECT 1 FROM tests WHERE id = ?", (test_id,)).fetchone() is None:
+        raise HTTPException(status_code=404, detail=f"试验 {test_id} 不存在")
+    info = get_archive(conn, test_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"试验 {test_id} 尚未归档")
+    info["already_archived"] = False
+    return info
+
+
+@app.post(
+    "/tests/{test_id}/archive",
+    response_model=ArchiveOut,
+    tags=["试验归档"],
+    summary="按试验编号把压力明细无损压缩归档（按最细摘要块边界）",
+)
+def archive_test_by_id(test_id: int, conn: Connection = Depends(get_conn)):
+    try:
+        return archive_test(conn, test_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except AlreadyArchived as exc:
+        # 幂等：重复请求返回既有归档，不写副本
+        info = dict(exc.info)
+        info["already_archived"] = True
+        return info
+    except (ArchiveError, ArchiveCodecError) as exc:
+        # 事务已回滚：原采样与摘要均未改动，仍可按原接口查询
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except sqlite3.OperationalError as exc:
+        # 写锁竞争（另一归档/导入正在提交）：本次未改动任何数据
+        raise HTTPException(status_code=409, detail=f"归档暂时无法执行：{exc}") from None
 
 
 @app.get(

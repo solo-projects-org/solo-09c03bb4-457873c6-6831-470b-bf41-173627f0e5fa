@@ -118,7 +118,11 @@ def import_test(
     content: bytes,
     block_size: int | None = None,
 ) -> dict:
-    """完整导入一次试验：采样入库 + 多级摘要，单事务完成。"""
+    """完整导入一次试验：采样入库 + 多级摘要，单事务完成并立即提交。
+
+    显式提交而非交给请求级连接的 yield 清理：依赖清理在响应发出后才运行，
+    延迟提交会让紧随其后的请求读不到本次导入（read-your-writes 竞态）。
+    """
     block_size = block_size or config.BLOCK_SIZE
     samples = parse_csv(content)
 
@@ -138,7 +142,10 @@ def import_test(
             "UPDATE tests SET max_level = ? WHERE id = ?", (max_level, test_id)
         )
     except sqlite3.IntegrityError as exc:
+        conn.rollback()
         raise CsvValidationError(f"试验名称 {name!r} 已存在") from exc
+
+    conn.commit()  # 响应返回前提交，保证后续请求立即可见
 
     block_counts = dict(
         conn.execute(

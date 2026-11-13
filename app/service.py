@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 from . import config
+from .archive import is_archived
 from .schemas import BucketOut, PointOut, QueryMetrics, QueryResponse
 from .summaries import Stats, range_summary
 
@@ -46,6 +47,9 @@ def bucket_query(
     if test is None:
         raise KeyError(f"试验 {test_id} 不存在")
 
+    # 归档后原采样行已删除：切块查询改走压缩块解压；摘要块命中路径不变
+    archived = is_archived(conn, test_id)
+
     span = end_ts - start_ts
     bucket_count = (span + bucket_width_ms - 1) // bucket_width_ms
     if bucket_count > config.MAX_BUCKETS:
@@ -68,6 +72,7 @@ def bucket_query(
             test["max_level"],
             config.BLOCK_SIZE,
             metrics,
+            archived,
         )
         if stats is None or stats.sample_count == 0:
             missing_count += 1
